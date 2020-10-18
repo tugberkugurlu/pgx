@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgconn/stmtcache"
 	"github.com/jackc/pgtype"
 	"github.com/jackc/pgx/v4"
+	"github.com/jackc/pgx/v4/pgxpool"
 	"github.com/stretchr/testify/require"
 )
 
@@ -38,6 +39,63 @@ func BenchmarkMinimalUnpreparedSelectWithoutStatementCache(b *testing.B) {
 		if n != int64(i) {
 			b.Fatalf("expected %d, got %d", i, n)
 		}
+	}
+}
+
+// '{ "phones":[ {"type": "mobile", "phone": "001001"} , {"type": "fix", "phone": "002002"} ] }'
+type Foo struct {
+	Phones []struct {
+		Type  string `json:"type"`
+		Phone string `json:"phone"`
+	} `json:"phones"`
+}
+
+func BenchmarkJSONSelect(b *testing.B) {
+	connConfig, err := pgxpool.ParseConfig(os.Getenv("PGX_TEST_DATABASE"))
+	if err != nil {
+		b.Fatalf("pgxpool.ParseConfig unexpectedly failed: %v", err)
+	}
+	connConfig.MaxConns = 50
+	pool, err := pgxpool.ConnectConfig(context.Background(), connConfig)
+	if err != nil {
+		b.Fatalf("pgxpool.ConnectConfig unexpectedly failed: %v", err)
+	}
+	defer pool.Close()
+
+	func() {
+		c, err := pool.Acquire(context.Background())
+		if err != nil {
+			b.Fatalf("pool.Acquire unexpectedly failed: %v", err)
+		}
+		defer c.Release()
+		mustExec(b, c.Conn(), benchmarkJSONTableCreateSQL)
+	}()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		func() {
+			rows, err := pool.Query(context.Background(), "select data from j;")
+			if err != nil {
+				b.Fatalf("pool.Query unexpectedly failed: %v", err)
+			}
+			defer rows.Close()
+
+			var result []*Foo
+			for rows.Next() {
+				var data Foo
+				scanErr := rows.Scan(&data)
+				if scanErr != nil {
+					b.Fatalf("rows.Scan unexpectedly failed: %v", scanErr)
+				}
+				result = append(result, &data)
+			}
+			if err := rows.Err(); err != nil {
+				b.Fatalf("rows.Err() is not nil: %v", err)
+			}
+			if resLen := len(result); resLen != 3 {
+				b.Fatalf("len(result) is expected to be 3, but got %d", resLen)
+			}
+		}()
 	}
 }
 
@@ -402,6 +460,17 @@ create table t(
 	bool_2 bool not null,
 	bool_3 bool not null
 );
+`
+
+const benchmarkJSONTableCreateSQL = `drop table if exists j;
+
+create table j(
+	data jsonb NOT NULL
+);
+
+insert into j(data) values ('{ "phones":[ {"type": "mobile", "phone": "001001"} , {"type": "fix", "phone": "002002"} ] }');
+insert into j(data) values ('{ "phones":[ {"type": "mobile-2", "phone": "001001"} , {"type": "fix-2", "phone": "002002"} ] }');
+insert into j(data) values ('{ "phones":[ {"type": "mobile-3", "phone": "001001"} , {"type": "fix-3", "phone": "002002"} ] }');
 `
 
 const benchmarkWriteTableInsertSQL = `insert into t(
